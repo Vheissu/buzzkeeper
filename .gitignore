@@ -2,3 +2,4 @@ target/
 .env
 data/
 .DS_Store
+blog-post-announcement.md

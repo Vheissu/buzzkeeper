@@ -167,7 +167,10 @@ impl BotApp {
                     if let Some(model) = request.llm_model.clone() {
                         state.config.llm_model = Some(model);
                     }
-                    if request.asset_ledger.is_some() || request.asset_symbol.is_some() {
+                    if request.asset_ledger.is_some()
+                        || request.asset_symbol.is_some()
+                        || request.asset_issuer.is_some()
+                    {
                         let mut token = state.config.house_currency.clone();
                         if let Some(ledger) = request.asset_ledger.clone() {
                             token.ledger = ledger;
@@ -175,7 +178,21 @@ impl BotApp {
                         if let Some(symbol) = request.asset_symbol.clone() {
                             token.symbol = symbol.to_ascii_uppercase();
                         }
-                        token.issuer = request.asset_issuer.clone();
+                        match token.ledger {
+                            AssetLedger::HiveEngine => {
+                                if let Some(issuer) = request.asset_issuer.clone() {
+                                    token.issuer = Some(normalize_account_name(&issuer));
+                                }
+                                if token.issuer.is_none() {
+                                    bail!(
+                                        "Hive Engine assets require asset_issuer for strict matching"
+                                    );
+                                }
+                            }
+                            AssetLedger::Hive | AssetLedger::Hbd => {
+                                token.issuer = None;
+                            }
+                        }
                         state.config.house_currency = token;
                         state.config.drinks =
                             default_drinks(&state.config.house_currency, &state.config.theme);
@@ -1924,7 +1941,20 @@ fn matches_asset(token: &TokenSpec, payment: &IncomingPayment) -> bool {
         AssetLedger::Hive | AssetLedger::Hbd => payment.chain == PaymentChain::Hive,
         AssetLedger::HiveEngine => payment.chain == PaymentChain::HiveEngine,
     };
-    symbol_matches && chain_matches
+    if !(symbol_matches && chain_matches) {
+        return false;
+    }
+
+    match token.ledger {
+        AssetLedger::Hive | AssetLedger::Hbd => true,
+        AssetLedger::HiveEngine => match token.issuer.as_deref() {
+            Some(expected_issuer) => payment
+                .issuer
+                .as_deref()
+                .is_some_and(|actual| actual.eq_ignore_ascii_case(expected_issuer)),
+            None => false,
+        },
+    }
 }
 
 fn normalize_account_name(input: &str) -> String {
@@ -1933,12 +1963,13 @@ fn normalize_account_name(input: &str) -> String {
 
 fn unique_payment_id(payment: &IncomingPayment) -> String {
     format!(
-        "{:?}:{}:{}:{}:{}:{}",
+        "{:?}:{}:{}:{}:{}:{}:{}",
         payment.chain,
         payment.tx_id,
         payment.sender,
         payment.recipient,
         payment.symbol,
+        payment.issuer.as_deref().unwrap_or(""),
         payment.amount
     )
 }
@@ -1978,13 +2009,14 @@ mod tests {
     use crate::{
         config::PaymentRuntimeConfig,
         llm::{LlmConfig, ProviderKind},
-        model::{GuildState, MemoryEntry, ThemeSkin, default_house_currency},
+        model::{AssetLedger, GuildState, MemoryEntry, ThemeSkin, TokenSpec, default_house_currency},
         payments::{IncomingPayment, PaymentChain},
         store::JsonStore,
     };
 
     use super::{
-        ActorRef, BotApp, PaymentIntent, cooldown_remaining_secs, parse_payment_memo,
+        ActorRef, BotApp, PaymentIntent, SetupRequest, cooldown_remaining_secs, matches_asset,
+        parse_payment_memo,
         sanitize_model_reply,
     };
 
@@ -2066,6 +2098,7 @@ mod tests {
             sender: "beggars".to_string(),
             recipient: "baronbotley".to_string(),
             symbol: "HIVE".to_string(),
+            issuer: None,
             amount: "0.001".to_string(),
             memo: Some("hive-stream getTransaction test".to_string()),
             block_height: 1,
@@ -2099,6 +2132,7 @@ mod tests {
             sender: "beggars".to_string(),
             recipient: "baronbotley".to_string(),
             symbol: "HIVE".to_string(),
+            issuer: None,
             amount: "0.001".to_string(),
             memo: Some("tip".to_string()),
             block_height: 1,
@@ -2132,6 +2166,7 @@ mod tests {
             sender: "beggars".to_string(),
             recipient: "baronbotley".to_string(),
             symbol: "HIVE".to_string(),
+            issuer: None,
             amount: "1.000".to_string(),
             memo: None,
             block_height: 1,
@@ -2143,6 +2178,70 @@ mod tests {
             app.resolve_payment_intent(&state, &payment, 1.0),
             Some(PaymentIntent::Drink(slug)) if slug == "first-round"
         ));
+    }
+
+    #[tokio::test]
+    async fn configure_guild_requires_issuer_for_hive_engine_assets() {
+        let app = make_app().await;
+
+        let error = app
+            .configure_guild(SetupRequest {
+                guild_id: 1,
+                setup_channel_id: 10,
+                bot_name: None,
+                theme: None,
+                llm_provider: None,
+                llm_model: None,
+                asset_ledger: Some(AssetLedger::HiveEngine),
+                asset_symbol: Some("LEO".to_string()),
+                asset_issuer: None,
+                payment_account: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Hive Engine assets require asset_issuer")
+        );
+    }
+
+    #[test]
+    fn matches_asset_requires_matching_hive_engine_issuer() {
+        let token = TokenSpec {
+            ledger: AssetLedger::HiveEngine,
+            symbol: "LEO".to_string(),
+            issuer: Some("leo.tokens".to_string()),
+        };
+        let base_payment = IncomingPayment {
+            chain: PaymentChain::HiveEngine,
+            tx_id: "engine-1".to_string(),
+            tx_ref: Some("engine-1".to_string()),
+            sender: "beggars".to_string(),
+            recipient: "buzzkeeper.bot".to_string(),
+            symbol: "LEO".to_string(),
+            issuer: Some("leo.tokens".to_string()),
+            amount: "1.000".to_string(),
+            memo: Some("drink:first-round".to_string()),
+            block_height: 1,
+            timestamp: dt("2026-03-12T10:00:00Z"),
+            raw_payload: None,
+        };
+
+        assert!(matches_asset(&token, &base_payment));
+
+        let wrong_issuer = IncomingPayment {
+            issuer: Some("someone-else".to_string()),
+            ..base_payment.clone()
+        };
+        assert!(!matches_asset(&token, &wrong_issuer));
+
+        let missing_issuer = IncomingPayment {
+            issuer: None,
+            ..base_payment
+        };
+        assert!(!matches_asset(&token, &missing_issuer));
     }
 
     #[test]

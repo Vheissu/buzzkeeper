@@ -357,7 +357,7 @@ The configured house asset can be:
 
 - HIVE
 - HBD
-- a Hive Engine token symbol
+- a Hive Engine token symbol plus issuer
 
 You set that asset with `/setup`.
 
@@ -372,8 +372,10 @@ For HIVE:
 For a Hive Engine token:
 
 ```text
-/setup bot_name:Buzzkeeper theme:tavern llm_provider:ollama llm_model:qwen3:4b asset_ledger:hive-engine asset_symbol:LEO asset_issuer:leofinance payment_account:buzzkeeper.bot
+/setup bot_name:Buzzkeeper theme:tavern llm_provider:ollama llm_model:qwen3:4b asset_ledger:hive-engine asset_symbol:LEO asset_issuer:leo.tokens payment_account:buzzkeeper.bot
 ```
+
+`asset_issuer` is required for Hive Engine assets. Buzzkeeper resolves the token issuer from the Hive Engine token registry and rejects transfers that do not match the configured issuer.
 
 Then set the Discord channel where payment reactions should be posted:
 
@@ -443,7 +445,7 @@ Be aware of current behavior:
 - Buzzkeeper only ingests incoming transfers
 - it does not broadcast outbound on-chain operations
 - it does not use your Hive private keys today
-- Hive Engine matching is currently based on ledger + symbol; issuer storage exists, but strict issuer enforcement is not yet implemented in the matching logic
+- Hive Engine assets require `asset_issuer`, and Buzzkeeper enforces issuer matching against the Hive Engine token registry before accepting a transfer
 
 ## Public Tavern Mode
 
@@ -653,7 +655,6 @@ Check:
 
 ## Roadmap
 
-- stricter Hive Engine issuer enforcement
 - custom admin-defined drinks and actions
 - timezone-aware quiet hours
 - richer server events and quests

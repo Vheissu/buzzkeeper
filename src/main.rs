@@ -119,7 +119,7 @@ async fn setup(
     #[description = "Model override for the chosen provider"] llm_model: Option<String>,
     #[description = "hive | hbd | hive-engine"] asset_ledger: Option<String>,
     #[description = "Token symbol, for example HIVE, HBD, LEO"] asset_symbol: Option<String>,
-    #[description = "Hive Engine issuer or token namespace"] asset_issuer: Option<String>,
+    #[description = "Required for Hive Engine assets: issuer or token namespace"] asset_issuer: Option<String>,
     #[description = "Hive account to watch for incoming payments"] payment_account: Option<String>,
 ) -> Result<()> {
     ensure_admin(ctx).await?;

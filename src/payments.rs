@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -42,6 +42,7 @@ pub struct IncomingPayment {
     pub sender: String,
     pub recipient: String,
     pub symbol: String,
+    pub issuer: Option<String>,
     pub amount: String,
     pub memo: Option<String>,
     pub block_height: u64,
@@ -102,6 +103,10 @@ impl PaymentIngestConfig {
             .timeout(Duration::from_secs(self.timeout_secs.max(1)))
             .build()
             .context("failed to build payment http client")
+    }
+
+    pub fn hive_engine_contracts_api_url(&self) -> String {
+        derive_hive_engine_contracts_api_url(&self.hive_engine_api_url)
     }
 }
 
@@ -378,6 +383,7 @@ impl HiveClient {
 pub struct HiveEngineClient {
     client: Client,
     endpoint: String,
+    contracts_endpoint: String,
 }
 
 impl HiveEngineClient {
@@ -385,6 +391,7 @@ impl HiveEngineClient {
         Self {
             client,
             endpoint: config.hive_engine_api_url.clone(),
+            contracts_endpoint: config.hive_engine_contracts_api_url(),
         }
     }
 
@@ -425,6 +432,8 @@ impl HiveEngineClient {
         let mut payments = Vec::new();
         let mut newest_cursor = cursor.clone();
 
+        let mut issuer_cache = HashMap::<String, Option<String>>::new();
+
         for block_number in cursor.last_block.saturating_add(1)..=latest.block_number {
             let block = self.block_info(block_number).await?;
             newest_cursor.last_block = block.block_number;
@@ -464,6 +473,14 @@ impl HiveEngineClient {
                         .and_then(Value::as_str)
                         .unwrap_or("UNKNOWN")
                         .to_string();
+                    let issuer = match issuer_cache.get(&symbol) {
+                        Some(value) => value.clone(),
+                        None => {
+                            let value = self.token_issuer(&symbol).await?;
+                            issuer_cache.insert(symbol.clone(), value.clone());
+                            value
+                        }
+                    };
                     let amount = event
                         .data
                         .get("quantity")
@@ -483,6 +500,7 @@ impl HiveEngineClient {
                         sender,
                         recipient: to.to_string(),
                         symbol,
+                        issuer,
                         amount,
                         memo,
                         block_height: block.block_number,
@@ -529,6 +547,30 @@ impl HiveEngineClient {
         .await?;
 
         Ok(response.result)
+    }
+
+    async fn token_issuer(&self, symbol: &str) -> Result<Option<String>> {
+        let response: HiveEngineFindOneResponse<HiveEngineTokenRecord> = post_json(
+            &self.client,
+            &self.contracts_endpoint,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "findOne",
+                "params": {
+                    "contract": "tokens",
+                    "table": "tokens",
+                    "query": {
+                        "symbol": symbol,
+                    },
+                },
+                "id": 1,
+            }),
+        )
+        .await?;
+
+        Ok(response
+            .result
+            .and_then(|record| normalize_token_issuer(record.issuer)))
     }
 }
 
@@ -580,6 +622,7 @@ fn parse_hive_history_entry(
         sender,
         recipient: recipient.to_string(),
         symbol,
+        issuer: None,
         amount,
         memo,
         block_height: entry.block,
@@ -664,6 +707,25 @@ fn parse_hive_engine_logs(logs: Option<&str>) -> Result<Vec<HiveEngineLogEvent>>
 
 fn account_matches(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
+}
+
+fn normalize_token_issuer(input: String) -> Option<String> {
+    let trimmed = input.trim().trim_start_matches('@').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn derive_hive_engine_contracts_api_url(blockchain_url: &str) -> String {
+    if let Some(prefix) = blockchain_url.strip_suffix("/blockchain") {
+        return format!("{prefix}/contracts");
+    }
+    if let Some(prefix) = blockchain_url.strip_suffix("blockchain") {
+        return format!("{prefix}contracts");
+    }
+    format!("{}/contracts", blockchain_url.trim_end_matches('/'))
 }
 
 fn normalize_zero_tx_id(tx_id: Option<String>) -> Option<String> {
@@ -757,6 +819,11 @@ struct HiveEngineBlockResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct HiveEngineFindOneResponse<T> {
+    result: Option<T>,
+}
+
+#[derive(Debug, Deserialize)]
 struct HiveEngineBlockInfo {
     #[serde(rename = "blockNumber")]
     block_number: u64,
@@ -788,4 +855,26 @@ struct HiveEngineLogEvent {
     event: String,
     #[serde(default)]
     data: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct HiveEngineTokenRecord {
+    issuer: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_hive_engine_contracts_api_url;
+
+    #[test]
+    fn derives_contracts_endpoint_from_blockchain_endpoint() {
+        assert_eq!(
+            derive_hive_engine_contracts_api_url("https://api.hive-engine.com/rpc/blockchain"),
+            "https://api.hive-engine.com/rpc/contracts"
+        );
+        assert_eq!(
+            derive_hive_engine_contracts_api_url("https://example.com/custom/blockchain"),
+            "https://example.com/custom/contracts"
+        );
+    }
 }

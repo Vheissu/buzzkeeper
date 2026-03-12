@@ -246,6 +246,6 @@ If public tavern mode is enabled but the bot never responds to normal messages, 
 - sign outbound Hive transactions
 - hold or use Hive private keys
 - support safe multi-instance shared state
-- enforce Hive Engine issuer at ingest time
+- keep Hive Engine issuer enforcement enabled by setting `asset_issuer` during setup
 
 If you add outbound chain operations later, revisit the deployment model and key-management docs before going live.

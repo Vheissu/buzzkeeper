@@ -1,13 +1,18 @@
 #![allow(dead_code)]
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::time::sleep;
 
 use crate::model::PricedItem;
 
@@ -17,6 +22,12 @@ const DEFAULT_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_HISTORY_BATCH_SIZE: u32 = 100;
 const HIVE_NAI: &str = "@@000000021";
 const HBD_NAI: &str = "@@000000013";
+const TRANSIENT_RETRY_DELAYS_MS: [u64; 2] = [100, 250];
+
+fn token_issuer_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static TOKEN_ISSUER_CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    TOKEN_ISSUER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TipReceipt {
@@ -76,6 +87,7 @@ pub struct HiveEngineCursor {
 pub struct PaymentPollOutcome {
     pub cursor: PaymentCursor,
     pub payments: Vec<IncomingPayment>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +158,7 @@ impl PaymentAdapter for ManualPaymentAdapter {
         Ok(PaymentPollOutcome {
             cursor: cursor.cloned().unwrap_or_default(),
             payments: Vec::new(),
+            warnings: Vec::new(),
         })
     }
 }
@@ -183,52 +196,67 @@ impl HivePaymentAdapter {
     }
 
     pub async fn poll(&self, cursor: Option<&PaymentCursor>) -> Result<PaymentPollOutcome> {
-        let seed = match cursor {
-            Some(cursor) => cursor.clone(),
-            None => {
-                return Ok(PaymentPollOutcome {
-                    cursor: self.bootstrap().await?,
-                    payments: Vec::new(),
-                });
+        let hive_client = HiveClient::new(self.client.clone(), &self.config);
+        let hive_engine_client = HiveEngineClient::new(self.client.clone(), &self.config);
+        let seed = cursor.cloned().unwrap_or_default();
+        let mut warnings = Vec::new();
+
+        let (hive_cursor, mut payments) = if let Some(hive_cursor) = seed.hive.as_ref() {
+            match hive_client
+                .poll_incoming(&self.config.bot_account, hive_cursor)
+                .await
+            {
+                Ok((cursor, payments)) => (Some(cursor), payments),
+                Err(error) => {
+                    warnings.push(summarize_payment_poll_error("Hive", &error));
+                    (Some(hive_cursor.clone()), Vec::new())
+                }
+            }
+        } else {
+            match hive_client.bootstrap_cursor(&self.config.bot_account).await {
+                Ok(cursor) => (Some(cursor), Vec::new()),
+                Err(error) => {
+                    warnings.push(summarize_payment_poll_error("Hive", &error));
+                    (None, Vec::new())
+                }
             }
         };
 
-        let hive_client = HiveClient::new(self.client.clone(), &self.config);
-        let hive_engine_client = HiveEngineClient::new(self.client.clone(), &self.config);
-
-        let (hive_cursor, mut payments) = hive_client
-            .poll_incoming(
-                &self.config.bot_account,
-                seed.hive.as_ref().unwrap_or(&HiveHistoryCursor {
-                    account: self.config.bot_account.clone(),
-                    last_sequence: 0,
-                    last_block: 0,
-                    last_tx_id: None,
-                }),
-            )
-            .await?;
-
-        let (hive_engine_cursor, mut hive_engine_payments) = hive_engine_client
-            .poll_incoming(
-                &self.config.bot_account,
-                seed.hive_engine.as_ref().unwrap_or(&HiveEngineCursor {
-                    account: self.config.bot_account.clone(),
-                    last_block: 0,
-                    last_ref_hive_block: None,
-                    last_tx_id: None,
-                }),
-            )
-            .await?;
+        let (hive_engine_cursor, mut hive_engine_payments) =
+            if let Some(hive_engine_cursor) = seed.hive_engine.as_ref() {
+                match hive_engine_client
+                    .poll_incoming(&self.config.bot_account, hive_engine_cursor)
+                    .await
+                {
+                    Ok((cursor, payments)) => (Some(cursor), payments),
+                    Err(error) => {
+                        warnings.push(summarize_payment_poll_error("Hive Engine", &error));
+                        (Some(hive_engine_cursor.clone()), Vec::new())
+                    }
+                }
+            } else {
+                match hive_engine_client
+                    .bootstrap_cursor(&self.config.bot_account)
+                    .await
+                {
+                    Ok(cursor) => (Some(cursor), Vec::new()),
+                    Err(error) => {
+                        warnings.push(summarize_payment_poll_error("Hive Engine", &error));
+                        (None, Vec::new())
+                    }
+                }
+            };
 
         payments.append(&mut hive_engine_payments);
         payments.sort_by_key(|payment| (payment.block_height, payment.timestamp));
 
         Ok(PaymentPollOutcome {
             cursor: PaymentCursor {
-                hive: Some(hive_cursor),
-                hive_engine: Some(hive_engine_cursor),
+                hive: hive_cursor,
+                hive_engine: hive_engine_cursor,
             },
             payments,
+            warnings,
         })
     }
 }
@@ -357,6 +385,7 @@ impl HiveClient {
         let response: HiveAccountHistoryResponse = post_json(
             &self.client,
             &self.endpoint,
+            "account_history_api.get_account_history",
             &json!({
                 "jsonrpc": "2.0",
                 "method": "account_history_api.get_account_history",
@@ -519,6 +548,7 @@ impl HiveEngineClient {
         let response: HiveEngineBlockResponse = post_json(
             &self.client,
             &self.endpoint,
+            "getLatestBlockInfo",
             &json!({
                 "jsonrpc": "2.0",
                 "method": "getLatestBlockInfo",
@@ -535,6 +565,7 @@ impl HiveEngineClient {
         let response: HiveEngineBlockResponse = post_json(
             &self.client,
             &self.endpoint,
+            "getBlockInfo",
             &json!({
                 "jsonrpc": "2.0",
                 "method": "getBlockInfo",
@@ -550,9 +581,23 @@ impl HiveEngineClient {
     }
 
     async fn token_issuer(&self, symbol: &str) -> Result<Option<String>> {
+        let cache_key = format!(
+            "{}::{}",
+            self.contracts_endpoint,
+            symbol.trim().to_ascii_uppercase()
+        );
+        if let Some(value) = token_issuer_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&cache_key).cloned())
+        {
+            return Ok(value);
+        }
+
         let response: HiveEngineFindOneResponse<HiveEngineTokenRecord> = post_json(
             &self.client,
             &self.contracts_endpoint,
+            "token issuer lookup",
             &json!({
                 "jsonrpc": "2.0",
                 "method": "findOne",
@@ -568,9 +613,13 @@ impl HiveEngineClient {
         )
         .await?;
 
-        Ok(response
+        let issuer = response
             .result
-            .and_then(|record| normalize_token_issuer(record.issuer)))
+            .and_then(|record| normalize_token_issuer(record.issuer));
+        if let Ok(mut cache) = token_issuer_cache().lock() {
+            cache.insert(cache_key, issuer.clone());
+        }
+        Ok(issuer)
     }
 }
 
@@ -718,6 +767,43 @@ fn normalize_token_issuer(input: String) -> Option<String> {
     }
 }
 
+fn summarize_payment_poll_error(chain: &str, error: &anyhow::Error) -> String {
+    let text = format!("{error:#}");
+    let request_name = extract_request_name(&text);
+    let detail = if text.contains("status 503 Service Unavailable") {
+        describe_request_issue(request_name, "returned 503 Service Unavailable")
+    } else if text.contains("status 502 Bad Gateway") {
+        describe_request_issue(request_name, "returned 502 Bad Gateway")
+    } else if text.contains("status 504 Gateway Timeout") {
+        describe_request_issue(request_name, "returned 504 Gateway Timeout")
+    } else if text.to_ascii_lowercase().contains("timed out") {
+        describe_request_issue(request_name, "timed out")
+    } else if text.to_ascii_lowercase().contains("connection refused") {
+        describe_request_issue(request_name, "connection was refused")
+    } else {
+        text.lines()
+            .next()
+            .unwrap_or("request failed")
+            .trim()
+            .to_string()
+    };
+
+    format!("{chain} payment RPC issue: {detail}. Keeping the previous cursor and retrying later.")
+}
+
+fn extract_request_name(text: &str) -> Option<&str> {
+    text.split(" request to ")
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn describe_request_issue(request_name: Option<&str>, description: &str) -> String {
+    request_name
+        .map(|name| format!("{name} {description}"))
+        .unwrap_or_else(|| format!("upstream {description}"))
+}
+
 fn derive_hive_engine_contracts_api_url(blockchain_url: &str) -> String {
     if let Some(prefix) = blockchain_url.strip_suffix("/blockchain") {
         return format!("{prefix}/contracts");
@@ -739,28 +825,64 @@ fn normalize_zero_tx_id(tx_id: Option<String>) -> Option<String> {
     })
 }
 
-async fn post_json<T>(client: &Client, endpoint: &str, body: &Value) -> Result<T>
+async fn post_json<T>(
+    client: &Client,
+    endpoint: &str,
+    request_name: &str,
+    body: &Value,
+) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let response = client
-        .post(endpoint)
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("request to {endpoint} failed"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .with_context(|| format!("failed reading response from {endpoint}"))?;
+    for delay_ms in [
+        Some(TRANSIENT_RETRY_DELAYS_MS[0]),
+        Some(TRANSIENT_RETRY_DELAYS_MS[1]),
+        None,
+    ]
+    .into_iter()
+    {
+        let response = match client.post(endpoint).json(body).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                if attempt_is_retryable_transport(delay_ms, &error) {
+                    sleep(Duration::from_millis(delay_ms.unwrap())).await;
+                    continue;
+                }
+                return Err(error)
+                    .with_context(|| format!("{request_name} request to {endpoint} failed"));
+            }
+        };
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .with_context(|| format!("failed reading response from {endpoint}"))?;
 
-    if !status.is_success() {
-        bail!("request to {endpoint} failed with status {status}: {text}");
+        if !status.is_success() {
+            if attempt_is_retryable_status(delay_ms, status) {
+                sleep(Duration::from_millis(delay_ms.unwrap())).await;
+                continue;
+            }
+            bail!("{request_name} request to {endpoint} failed with status {status}: {text}");
+        }
+
+        return serde_json::from_str(&text)
+            .with_context(|| format!("failed to decode response from {endpoint}: {text}"));
     }
 
-    serde_json::from_str(&text)
-        .with_context(|| format!("failed to decode response from {endpoint}: {text}"))
+    unreachable!("retry loop always returns or bails")
+}
+
+fn attempt_is_retryable_transport(delay_ms: Option<u64>, error: &reqwest::Error) -> bool {
+    delay_ms.is_some() && (error.is_timeout() || error.is_connect())
+}
+
+fn attempt_is_retryable_status(delay_ms: Option<u64>, status: StatusCode) -> bool {
+    delay_ms.is_some()
+        && matches!(
+            status,
+            StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+        )
 }
 
 #[derive(Debug, Deserialize)]
@@ -864,7 +986,24 @@ struct HiveEngineTokenRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::derive_hive_engine_contracts_api_url;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use anyhow::anyhow;
+    use reqwest::Client;
+    use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        task::JoinHandle,
+    };
+
+    use super::{
+        HiveEngineClient, PaymentIngestConfig, derive_hive_engine_contracts_api_url, post_json,
+        summarize_payment_poll_error,
+    };
 
     #[test]
     fn derives_contracts_endpoint_from_blockchain_endpoint() {
@@ -876,5 +1015,117 @@ mod tests {
             derive_hive_engine_contracts_api_url("https://example.com/custom/blockchain"),
             "https://example.com/custom/contracts"
         );
+    }
+
+    #[test]
+    fn summarizes_upstream_503_without_dumping_html() {
+        let summary = summarize_payment_poll_error(
+            "Hive Engine",
+            &anyhow!(
+                "getLatestBlockInfo request to https://api.hive-engine.com/rpc/blockchain failed with status 503 Service Unavailable: <html>...</html>"
+            ),
+        );
+
+        assert_eq!(
+            summary,
+            "Hive Engine payment RPC issue: getLatestBlockInfo returned 503 Service Unavailable. Keeping the previous cursor and retrying later."
+        );
+    }
+
+    #[tokio::test]
+    async fn post_json_retries_transient_503s() {
+        let responses = Arc::new([
+            http_response(503, "<html>busy</html>", "text/html"),
+            http_response(503, "<html>busy again</html>", "text/html"),
+            http_response(200, r#"{"ok":true}"#, "application/json"),
+        ]);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (endpoint, server) = spawn_test_server(responses.clone(), hits.clone()).await;
+
+        let value: serde_json::Value = post_json(
+            &Client::new(),
+            &endpoint,
+            "getLatestBlockInfo",
+            &json!({"ping": true}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(value, json!({"ok": true}));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn token_issuer_lookup_uses_process_cache() {
+        let responses = Arc::new([http_response(
+            200,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"issuer":"leo.tokens"}}"#,
+            "application/json",
+        )]);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (endpoint, server) = spawn_test_server(responses.clone(), hits.clone()).await;
+
+        let config = PaymentIngestConfig {
+            bot_account: "buzzkeeper.bot".to_string(),
+            hive_api_url: "https://api.hive.blog".to_string(),
+            hive_engine_api_url: format!("{endpoint}/blockchain"),
+            history_batch_size: 100,
+            timeout_secs: 5,
+        };
+        let client = HiveEngineClient::new(config.http_client().unwrap(), &config);
+
+        let first = client.token_issuer("LEO").await.unwrap();
+        let second = client.token_issuer("LEO").await.unwrap();
+
+        assert_eq!(first, Some("leo.tokens".to_string()));
+        assert_eq!(second, Some("leo.tokens".to_string()));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    async fn spawn_test_server(
+        responses: Arc<[String]>,
+        hits: Arc<AtomicUsize>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for response in responses.iter() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                hits.fetch_add(1, Ordering::SeqCst);
+                read_http_request(&mut stream).await;
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), server)
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) {
+        let mut buffer = [0u8; 4096];
+        let mut request = Vec::new();
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+    }
+
+    fn http_response(status: u16, body: &str, content_type: &str) -> String {
+        let reason = match status {
+            200 => "OK",
+            503 => "Service Unavailable",
+            _ => "Test Response",
+        };
+        format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
     }
 }

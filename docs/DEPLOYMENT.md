@@ -4,19 +4,20 @@ This guide covers how to deploy Buzzkeeper locally, with Docker, and on common c
 
 ## Before You Deploy
 
-Buzzkeeper is currently a single-process application with JSON file storage.
+Buzzkeeper is currently a single-process application with JSON guild state plus a SQLite memory index.
 
 That means production deployments should follow these rules:
 
 - run exactly one replica
 - mount persistent storage
-- point `STORAGE_PATH` at that persistent location
+- point `STORAGE_PATH` and `MEMORY_DB_PATH` at that persistent location
 - do not run multiple instances against separate local files and expect shared state
 
 Recommended production path:
 
 ```env
 STORAGE_PATH=/data/tavern-state.json
+MEMORY_DB_PATH=/data/tavern-state.memories.sqlite3
 ```
 
 ## Required Environment Variables
@@ -28,7 +29,23 @@ DISCORD_TOKEN=...
 DEFAULT_LLM_PROVIDER=ollama
 DEFAULT_LLM_MODEL=qwen3:4b
 STORAGE_PATH=/data/tavern-state.json
+MEMORY_DB_PATH=/data/tavern-state.memories.sqlite3
 ```
+
+Optional memory controls:
+
+```env
+MEMORY_MODEL_ASSISTED=true
+MEMORY_ANALYSIS_MAX_TOKENS=220
+MEMORY_EMBEDDING_MODEL=nomic-embed-text
+MEMORY_EMBEDDING_DIMENSIONS=128
+```
+
+Embedding notes:
+
+- leave `MEMORY_EMBEDDING_MODEL` unset to use deterministic local embeddings with no external dependency
+- set `MEMORY_EMBEDDING_MODEL` to enable provider-backed embeddings for the SQLite vector index
+- the SQLite mirror sync is incremental, so only changed memories are re-embedded and re-written
 
 If using local Ollama on the same machine:
 
@@ -69,6 +86,7 @@ docker run --rm \
   --name buzzkeeper \
   --env-file .env \
   -e STORAGE_PATH=/data/tavern-state.json \
+  -e MEMORY_DB_PATH=/data/tavern-state.memories.sqlite3 \
   -v $(pwd)/data:/data \
   buzzkeeper:latest
 ```
@@ -101,7 +119,8 @@ Typical flow:
 2. clone the repo
 3. copy `.env.example` to `.env`
 4. set `STORAGE_PATH=/data/tavern-state.json`
-5. run with a process supervisor
+5. set `MEMORY_DB_PATH=/data/tavern-state.memories.sqlite3`
+6. run with a process supervisor
 
 Example using `tmux`:
 
@@ -121,6 +140,7 @@ Recommended Railway setup:
 - deploy from this repo using the included Dockerfile
 - add a persistent volume mounted at `/data`
 - set `STORAGE_PATH=/data/tavern-state.json`
+- set `MEMORY_DB_PATH=/data/tavern-state.memories.sqlite3`
 - run only one replica
 
 Environment variables to set in Railway:
@@ -129,6 +149,7 @@ Environment variables to set in Railway:
 - `DEFAULT_LLM_PROVIDER`
 - `DEFAULT_LLM_MODEL`
 - `STORAGE_PATH`
+- `MEMORY_DB_PATH`
 - whichever provider-specific variables you use
 
 Two deployment patterns:
@@ -156,6 +177,7 @@ Recommended Fly setup:
 - deploy the Docker image
 - attach a volume mounted at `/data`
 - set `STORAGE_PATH=/data/tavern-state.json`
+- set `MEMORY_DB_PATH=/data/tavern-state.memories.sqlite3`
 - keep instance count at 1
 
 If you use Ollama remotely, set `OLLAMA_BASE_URL` to the remote endpoint.
@@ -168,7 +190,7 @@ Render can also host Buzzkeeper, but the same rule applies:
 
 - one instance
 - persistent disk
-- `STORAGE_PATH` on that disk
+- `STORAGE_PATH` and `MEMORY_DB_PATH` on that disk
 
 If persistent storage is not available on the plan you choose, use a different platform or move state into a real database first.
 
@@ -180,6 +202,7 @@ If persistent storage is not available on the plan you choose, use a different p
 - LLM: OpenAI / Anthropic / Gemini
 - Storage: mounted persistent disk
 - `STORAGE_PATH=/data/tavern-state.json`
+- `MEMORY_DB_PATH=/data/tavern-state.memories.sqlite3`
 
 ### Cheapest Local-Control Setup
 
@@ -197,10 +220,10 @@ If persistent storage is not available on the plan you choose, use a different p
 
 ## Upgrades and Restarts
 
-Because Buzzkeeper stores state in JSON, safe upgrade flow is:
+Because Buzzkeeper stores state in JSON plus SQLite, safe upgrade flow is:
 
 1. stop the process
-2. back up the JSON state file
+2. back up the JSON state file and SQLite memory index
 3. pull latest code
 4. run `cargo test`
 5. start the new version

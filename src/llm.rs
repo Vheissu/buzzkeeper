@@ -54,7 +54,7 @@ impl Default for LlmConfig {
             provider: ProviderKind::Offline,
             default_model: "tavern-gremlin".to_string(),
             temperature: 0.8,
-            max_tokens: 220,
+            max_tokens: 480,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             openai: Some(OpenAiConfig::default()),
             anthropic: Some(AnthropicConfig::default()),
@@ -175,6 +175,31 @@ pub fn build_provider(config: &LlmConfig) -> Result<Box<dyn LlmProvider>> {
         ProviderKind::Google => Ok(Box::new(GoogleProvider::new(config)?)),
         ProviderKind::Ollama => Ok(Box::new(OllamaProvider::new(config)?)),
     }
+}
+
+pub async fn embed_inputs(
+    config: &LlmConfig,
+    model: Option<&str>,
+    dimensions: usize,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let target_dimensions = dimensions.max(1);
+    let embeddings = match config.provider {
+        ProviderKind::Offline => bail!("offline provider does not support embeddings"),
+        ProviderKind::OpenAi => embed_with_openai(config, model, target_dimensions, inputs).await?,
+        ProviderKind::Ollama => embed_with_ollama(config, model, inputs).await?,
+        ProviderKind::Anthropic => bail!("anthropic provider does not expose embeddings here"),
+        ProviderKind::Google => bail!("google embedding support is not wired in yet"),
+    };
+
+    Ok(embeddings
+        .into_iter()
+        .map(|embedding| fit_embedding(&embedding, target_dimensions))
+        .collect())
 }
 
 #[derive(Debug, Clone)]
@@ -534,6 +559,127 @@ fn build_http_client(timeout_secs: u64) -> Result<Client> {
         .timeout(Duration::from_secs(timeout_secs.max(1)))
         .build()
         .context("failed to build llm http client")
+}
+
+async fn embed_with_openai(
+    config: &LlmConfig,
+    model: Option<&str>,
+    dimensions: usize,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let provider = config.openai.clone().unwrap_or_default();
+    let api_key = provider
+        .api_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing openai api key"))?;
+    let selected_model = model.unwrap_or("text-embedding-3-small");
+    let url = join_url(&provider.base_url, "embeddings")?;
+    let mut body = json!({
+        "model": selected_model,
+        "input": inputs,
+    });
+    body["dimensions"] = json!(dimensions);
+
+    let mut builder = build_http_client(config.timeout_secs)?
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&body);
+
+    if let Some(org) = &provider.organization {
+        builder = builder.header("OpenAI-Organization", org);
+    }
+    if let Some(project) = &provider.project {
+        builder = builder.header("OpenAI-Project", project);
+    }
+
+    let value = send_json(builder).await?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("openai embeddings response missing data"))?;
+
+    let mut rows = Vec::with_capacity(data.len());
+    for item in data {
+        let embedding = item
+            .get("embedding")
+            .ok_or_else(|| anyhow!("openai embeddings response missing embedding"))?;
+        rows.push(parse_embedding(embedding)?);
+    }
+    Ok(rows)
+}
+
+async fn embed_with_ollama(
+    config: &LlmConfig,
+    model: Option<&str>,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    let provider = config.ollama.clone().unwrap_or_default();
+    let selected_model = model.unwrap_or(&config.default_model);
+    let url = join_url(&provider.base_url, "api/embed")?;
+    let body = json!({
+        "model": selected_model,
+        "input": inputs,
+        "keep_alive": provider.keep_alive,
+    });
+
+    let value = send_json(
+        build_http_client(config.timeout_secs)?
+            .post(url)
+            .json(&body),
+    )
+    .await?;
+    if let Some(items) = value.get("embeddings").and_then(Value::as_array) {
+        return items.iter().map(parse_embedding).collect();
+    }
+
+    if let Some(single) = value.get("embedding") {
+        return Ok(vec![parse_embedding(single)?]);
+    }
+
+    bail!("ollama embedding response did not contain embeddings")
+}
+
+fn parse_embedding(value: &Value) -> Result<Vec<f32>> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("embedding payload was not an array"))?;
+    let mut embedding = Vec::with_capacity(items.len());
+    for item in items {
+        let number = item
+            .as_f64()
+            .ok_or_else(|| anyhow!("embedding value was not numeric"))?;
+        embedding.push(number as f32);
+    }
+    if embedding.is_empty() {
+        bail!("embedding payload was empty");
+    }
+    Ok(embedding)
+}
+
+fn fit_embedding(values: &[f32], dimensions: usize) -> Vec<f32> {
+    let target_dimensions = dimensions.max(1);
+    if values.is_empty() {
+        return vec![0.0; target_dimensions];
+    }
+
+    let mut projected = vec![0.0f32; target_dimensions];
+    for (index, value) in values.iter().enumerate() {
+        let bucket = index % target_dimensions;
+        projected[bucket] += *value;
+    }
+
+    let norm = projected
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in &mut projected {
+            *value /= norm;
+        }
+    }
+
+    projected
 }
 
 fn join_url(base_url: &str, path: &str) -> Result<Url> {

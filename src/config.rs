@@ -17,12 +17,22 @@ pub struct PaymentRuntimeConfig {
 }
 
 #[derive(Debug, Clone)]
+pub struct MemoryRuntimeConfig {
+    pub model_assisted: bool,
+    pub analysis_max_tokens: u32,
+    pub embedding_model: Option<String>,
+    pub embedding_dimensions: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub discord_token: String,
     pub storage_path: PathBuf,
+    pub memory_db_path: PathBuf,
     pub default_bot_name: String,
     pub default_theme: ThemeSkin,
     pub llm: LlmConfig,
+    pub memory: MemoryRuntimeConfig,
     pub payments: PaymentRuntimeConfig,
 }
 
@@ -35,6 +45,12 @@ impl AppConfig {
         let storage_path = PathBuf::from(
             env::var("STORAGE_PATH").unwrap_or_else(|_| "data/tavern-state.json".to_string()),
         );
+        let memory_db_path = PathBuf::from(env::var("MEMORY_DB_PATH").unwrap_or_else(|_| {
+            storage_path
+                .with_extension("memories.sqlite3")
+                .display()
+                .to_string()
+        }));
         let default_bot_name =
             env::var("DEFAULT_BOT_NAME").unwrap_or_else(|_| "Baron Botley".to_string());
         let default_theme = env::var("DEFAULT_THEME")
@@ -45,9 +61,25 @@ impl AppConfig {
         Ok(Self {
             discord_token,
             storage_path,
+            memory_db_path,
             default_bot_name,
             default_theme,
             llm: build_llm_config(),
+            memory: MemoryRuntimeConfig {
+                model_assisted: env::var("MEMORY_MODEL_ASSISTED")
+                    .ok()
+                    .and_then(|value| parse_bool(&value))
+                    .unwrap_or(true),
+                analysis_max_tokens: env::var("MEMORY_ANALYSIS_MAX_TOKENS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(220),
+                embedding_model: env::var("MEMORY_EMBEDDING_MODEL").ok(),
+                embedding_dimensions: env::var("MEMORY_EMBEDDING_DIMENSIONS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(128),
+            },
             payments: PaymentRuntimeConfig {
                 hive_api_url: env::var("HIVE_API_URL")
                     .unwrap_or_else(|_| "https://api.hive.blog".to_string()),
@@ -67,6 +99,14 @@ impl AppConfig {
                     .unwrap_or(15),
             },
         })
+    }
+}
+
+fn parse_bool(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }
 
@@ -112,7 +152,7 @@ fn build_llm_config() -> LlmConfig {
         max_tokens: env::var("LLM_MAX_TOKENS")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(240),
+            .unwrap_or(480),
         timeout_secs: env::var("LLM_TIMEOUT_SECS")
             .ok()
             .and_then(|value| value.parse().ok())

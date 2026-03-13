@@ -58,6 +58,18 @@ pub enum IntoxicationStage {
 }
 
 impl IntoxicationStage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sober => "sober",
+            Self::Warm => "warm",
+            Self::Tipsy => "tipsy",
+            Self::Buzzing => "buzzing",
+            Self::Cooked => "cooked",
+            Self::Gone => "gone",
+            Self::Hungover => "hungover",
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Sober => "Sober",
@@ -198,12 +210,86 @@ pub struct ActionDefinition {
     pub flavor: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryCategory {
+    Preference,
+    Lore,
+    Incident,
+    SelfReflection,
+}
+
+impl Default for MemoryCategory {
+    fn default() -> Self {
+        Self::Lore
+    }
+}
+
+impl MemoryCategory {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Preference => "preference",
+            Self::Lore => "lore",
+            Self::Incident => "incident",
+            Self::SelfReflection => "self_reflection",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySource {
+    UserNote,
+    BotUtterance,
+    SystemEvent,
+}
+
+impl Default for MemorySource {
+    fn default() -> Self {
+        Self::UserNote
+    }
+}
+
+impl MemorySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UserNote => "user_note",
+            Self::BotUtterance => "bot_utterance",
+            Self::SystemEvent => "system_event",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryEntry {
     pub at: DateTime<Utc>,
     pub user_id: String,
     pub user_name: String,
     pub text: String,
+    #[serde(default)]
+    pub category: MemoryCategory,
+    #[serde(default)]
+    pub source: MemorySource,
+    #[serde(default)]
+    pub bot_stage: Option<IntoxicationStage>,
+    #[serde(default)]
+    pub bot_persona: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub entities: Vec<String>,
+    #[serde(default = "default_memory_importance")]
+    pub importance: u8,
+    #[serde(default)]
+    pub recall_count: u32,
+    #[serde(default)]
+    pub last_recalled_at: Option<DateTime<Utc>>,
+}
+
+fn default_memory_importance() -> u8 {
+    3
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

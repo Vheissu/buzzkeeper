@@ -478,6 +478,8 @@ Recommended companion settings:
 
 ```text
 /set_reply_behavior mention_enabled:true mention_cooldown_secs:2 chat_cooldown_secs:1
+
+Direct mentions bypass cooldown when mention replies are enabled. `mention_cooldown_secs` is retained for compatibility, but direct @mentions should always get a reply unless another policy blocks it.
 ```
 
 ### Channel Scope
@@ -545,7 +547,7 @@ Set quiet hours:
 ### Conversation and Personality
 
 - `/set_reply_behavior`
-  - controls mention replies and `/chat` cooldowns
+  - controls whether direct mentions are enabled and the `/chat` cooldown
 - `/set_public_tavern`
   - enables or disables public tavern mode, ambient chance, and ambient cooldown
 - `/set_system_prompt`
@@ -556,6 +558,19 @@ Set quiet hours:
   - direct slash-command conversation with the bot
 - `/remember`
   - saves a lore note or recurring joke into persistent memory
+
+### Memory Model
+
+Buzzkeeper now treats memory as a small retrieval problem instead of dumping the latest notes into every prompt.
+
+- stored memories are persisted in JSON and kept in a larger pool
+- each reply recalls only the most relevant memories for the current message, speaker, and recent channel context
+- memories are grouped into broad categories like preferences, lore, incidents, and self-reflection
+- memories can carry bot-state context, so the bot can recall what it said or did while tipsy, buzzing, cooked, gone, or hungover
+- when model access is available, memories are automatically enriched with summaries, tags, entities, and importance scores for stronger retrieval
+- each incoming message can be analysed into retrieval topics, entities, categories, and requested bot states before recall runs
+- recalled memories update lightweight usage metadata so useful notes stay easier to surface over time
+- older state files remain compatible, missing memory metadata defaults safely on load
 
 ### Channel and Admin Policy
 
@@ -575,13 +590,22 @@ Set quiet hours:
 ### Direct Tavern Actions
 
 - `/drink`
-  - simulate buying the bot a drink in Discord
+  - admin-only complimentary test pour in Discord
 - `/action`
-  - trigger a tavern action without waiting for on-chain payment
+  - admin-only complimentary test action in Discord
+- `/set_stage`
+  - admin-only direct stage override for testing `sober` through `hungover`
+- `/clear_context`
+  - admin-only short-term conversation reset for the current channel, leaves long-term memories alone
+- `/sync_commands`
+  - admin-only guild command resync if a slash command is missing or stale
 
 ## Storage
 
-Buzzkeeper stores state in one JSON file.
+Buzzkeeper now uses two persistent stores:
+
+- a JSON file for guild state and bot configuration
+- a SQLite database for long-term memory indexing, FTS, and vector search
 
 Default:
 
@@ -589,17 +613,40 @@ Default:
 data/tavern-state.json
 ```
 
+Default memory index path:
+
+```text
+data/tavern-state.memories.sqlite3
+```
+
 Override it with:
 
 ```env
 STORAGE_PATH=/absolute/path/to/tavern-state.json
+MEMORY_DB_PATH=/absolute/path/to/tavern-state.memories.sqlite3
 ```
 
 Recommended production path:
 
 ```env
 STORAGE_PATH=/data/tavern-state.json
+MEMORY_DB_PATH=/data/tavern-state.memories.sqlite3
 ```
+
+Optional memory retrieval controls:
+
+```env
+MEMORY_MODEL_ASSISTED=true
+MEMORY_ANALYSIS_MAX_TOKENS=220
+MEMORY_EMBEDDING_MODEL=nomic-embed-text
+MEMORY_EMBEDDING_DIMENSIONS=128
+```
+
+Notes:
+
+- the SQLite mirror syncs incrementally, so unchanged memories are not re-indexed on every reply
+- if `MEMORY_EMBEDDING_MODEL` is set, Buzzkeeper will try provider-backed embeddings for the SQLite vector index
+- if embedding generation fails or is not configured, Buzzkeeper falls back to deterministic local embeddings so memory recall still works offline
 
 ## Deploying Buzzkeeper
 
@@ -609,7 +656,7 @@ Short version:
 
 - deploy one instance only
 - mount persistent storage
-- set `STORAGE_PATH` to that mounted path
+- set `STORAGE_PATH` and `MEMORY_DB_PATH` to that mounted path
 - keep outbound internet access enabled
 - enable `Message Content Intent` in Discord
 
@@ -626,7 +673,7 @@ Enable `Message Content Intent` in the Discord Developer Portal and restart the 
 
 ### Slash Commands Not Appearing
 
-Buzzkeeper registers commands globally on startup. Wait a minute or two after restart, or reopen Discord.
+Buzzkeeper registers commands globally on startup and also syncs them into joined guilds for faster visibility. If one command still looks stale, run `/sync_commands` as an admin in that server or reopen Discord.
 
 ### Old State File Fails to Load
 

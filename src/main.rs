@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod llm;
+mod memory_index;
 mod model;
 mod payments;
 mod store;
@@ -12,7 +13,7 @@ use app::{
     ActorRef, BotApp, DispatchMessage, MentionReplyOutcome, PublicReplyOutcome, SetupRequest,
 };
 use config::AppConfig;
-use model::{AssetLedger, GuildState, ThemeSkin};
+use model::{AssetLedger, GuildState, IntoxicationStage, ThemeSkin};
 use poise::serenity_prelude as serenity;
 use store::JsonStore;
 use tracing::{error, info, warn};
@@ -38,6 +39,11 @@ async fn main() -> Result<()> {
     let poll_interval_secs = config.payments.poll_interval_secs;
     let store = JsonStore::load(config.storage_path.clone()).await?;
     let app = Arc::new(BotApp::new(config.clone(), store)?);
+    let pruned_memories = app.sanitize_memory_corpus().await?;
+    if pruned_memories > 0 {
+        info!("pruned {pruned_memories} bad bot memory entries from persistent state");
+    }
+    app.sync_memory_indexes().await?;
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -61,18 +67,40 @@ async fn main() -> Result<()> {
                 sync_payments(),
                 drink(),
                 action(),
+                set_stage(),
+                clear_context(),
+                debug_memory(),
                 remember(),
+                sync_commands(),
                 chat(),
             ],
+            prefix_options: poise::PrefixFrameworkOptions {
+                mention_as_prefix: false,
+                ..Default::default()
+            },
             event_handler: |ctx, event, framework, data| {
                 Box::pin(event_handler(ctx, event, framework, data))
             },
             ..Default::default()
         })
-        .setup(move |ctx, _ready, framework| {
+        .setup(move |ctx, ready, framework| {
             let app = Arc::clone(&app);
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                for guild in &ready.guilds {
+                    if let Err(error) = poise::builtins::register_in_guild(
+                        ctx,
+                        &framework.options().commands,
+                        guild.id,
+                    )
+                    .await
+                    {
+                        warn!(
+                            guild_id = guild.id.get(),
+                            "failed to register guild commands on startup: {error:#}"
+                        );
+                    }
+                }
 
                 let poll_app = Arc::clone(&app);
                 let http = ctx.http.clone();
@@ -119,7 +147,8 @@ async fn setup(
     #[description = "Model override for the chosen provider"] llm_model: Option<String>,
     #[description = "hive | hbd | hive-engine"] asset_ledger: Option<String>,
     #[description = "Token symbol, for example HIVE, HBD, LEO"] asset_symbol: Option<String>,
-    #[description = "Required for Hive Engine assets: issuer or token namespace"] asset_issuer: Option<String>,
+    #[description = "Required for Hive Engine assets: issuer or token namespace"]
+    asset_issuer: Option<String>,
     #[description = "Hive account to watch for incoming payments"] payment_account: Option<String>,
 ) -> Result<()> {
     ensure_admin(ctx).await?;
@@ -290,7 +319,7 @@ async fn policy(ctx: Context<'_>) -> Result<()> {
         .unwrap_or_else(|| "unset".to_string());
 
     ctx.say(format!(
-        "**Policy**\nPayment account: **{}**\nPayment channel: **{}**\nAllowed channels: **{}**\nAdmin roles: **{}**\nMentions enabled: **{}**\nMention cooldown: **{}s**\nChat cooldown: **{}s**\nPublic tavern: **{}**\nAmbient chance: **{}%**\nAmbient cooldown: **{}s**\nQuiet hours: **{}**\nCursor: **{}**",
+        "**Policy**\nPayment account: **{}**\nPayment channel: **{}**\nAllowed channels: **{}**\nAdmin roles: **{}**\nMentions enabled: **{}**\nDirect mentions: **always reply when enabled**\nChat cooldown: **{}s**\nPublic tavern: **{}**\nAmbient chance: **{}%**\nAmbient cooldown: **{}s**\nQuiet hours: **{}**\nCursor: **{}**",
         state
             .config
             .bot_hive_account
@@ -305,7 +334,6 @@ async fn policy(ctx: Context<'_>) -> Result<()> {
         allowed_channels,
         admin_roles,
         state.config.mention_replies_enabled,
-        state.config.mention_cooldown_secs,
         state.config.chat_cooldown_secs,
         state.config.public_tavern_enabled,
         state.config.ambient_reply_chance_pct,
@@ -397,7 +425,8 @@ async fn set_quiet_hours(
 async fn set_reply_behavior(
     ctx: Context<'_>,
     #[description = "Whether direct @mentions should trigger replies"] mention_enabled: bool,
-    #[description = "Cooldown for mention replies in seconds"] mention_cooldown_secs: u64,
+    #[description = "Stored for compatibility only, direct mentions now bypass cooldown"]
+    mention_cooldown_secs: u64,
     #[description = "Cooldown for /chat replies in seconds"] chat_cooldown_secs: u64,
 ) -> Result<()> {
     ensure_admin(ctx).await?;
@@ -415,10 +444,8 @@ async fn set_reply_behavior(
         )
         .await?;
     ctx.say(format!(
-        "Mention replies: **{}**. Mention cooldown: **{}s**. Chat cooldown: **{}s**.",
-        state.config.mention_replies_enabled,
-        state.config.mention_cooldown_secs,
-        state.config.chat_cooldown_secs
+        "Mention replies: **{}**. Direct mentions bypass cooldown. Chat cooldown: **{}s**.",
+        state.config.mention_replies_enabled, state.config.chat_cooldown_secs
     ))
     .await?;
     Ok(())
@@ -610,12 +637,21 @@ async fn remove_admin_role(
 
 #[poise::command(slash_command, guild_only)]
 async fn sync_payments(ctx: Context<'_>) -> Result<()> {
+    let _deferred = ctx.defer_or_broadcast().await?;
     ensure_admin(ctx).await?;
     let summary = ctx.data().app.poll_payments().await?;
     flush_dispatches_http(ctx.serenity_context().http.as_ref(), &summary.messages).await?;
+    let warning_suffix = if summary.warnings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Warnings: **{}** upstream issue(s).",
+            summary.warnings.len()
+        )
+    };
     ctx.say(format!(
-        "Payment sync completed. Processed **{}** incoming payment events.",
-        summary.processed
+        "Payment sync completed. Processed **{}** incoming payment events.{}",
+        summary.processed, warning_suffix
     ))
     .await?;
     Ok(())
@@ -625,8 +661,12 @@ async fn sync_payments(ctx: Context<'_>) -> Result<()> {
 async fn drink(
     ctx: Context<'_>,
     #[description = "Drink slug from /catalog"] item: String,
-    #[description = "Optional tx reference or memo"] tx_ref: Option<String>,
+    #[description = "Optional tx reference or memo when mirroring a paid action"] tx_ref: Option<
+        String,
+    >,
 ) -> Result<()> {
+    let _ = tx_ref;
+    ensure_admin(ctx).await?;
     ensure_allowed_channel(ctx).await?;
     let guild_id = ctx
         .guild_id()
@@ -634,7 +674,7 @@ async fn drink(
     let outcome = ctx
         .data()
         .app
-        .buy_drink(guild_id.get(), actor_from_ctx(ctx), &item, tx_ref)
+        .buy_test_drink(guild_id.get(), actor_from_ctx(ctx), &item)
         .await?;
 
     ctx.say(format!("**{}**\n{}", outcome.headline, outcome.body))
@@ -648,6 +688,7 @@ async fn action(
     #[description = "Action slug from /catalog"] item: String,
     #[description = "Optional target name"] target: Option<String>,
 ) -> Result<()> {
+    ensure_admin(ctx).await?;
     ensure_allowed_channel(ctx).await?;
     let guild_id = ctx
         .guild_id()
@@ -655,7 +696,7 @@ async fn action(
     let outcome = ctx
         .data()
         .app
-        .trigger_action(guild_id.get(), actor_from_ctx(ctx), &item, target)
+        .trigger_test_action(guild_id.get(), actor_from_ctx(ctx), &item, target)
         .await?;
 
     ctx.say(format!("**{}**\n{}", outcome.headline, outcome.body))
@@ -664,10 +705,77 @@ async fn action(
 }
 
 #[poise::command(slash_command, guild_only)]
+async fn set_stage(
+    ctx: Context<'_>,
+    #[description = "sober | warm | tipsy | buzzing | cooked | gone | hungover"] stage: String,
+) -> Result<()> {
+    ensure_admin(ctx).await?;
+    ensure_allowed_channel(ctx).await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| anyhow!("command must run in a guild"))?;
+    let stage = parse_stage(&stage)?;
+    let outcome = ctx
+        .data()
+        .app
+        .set_stage(guild_id.get(), actor_from_ctx(ctx), stage)
+        .await?;
+
+    ctx.say(format!("**{}**\n{}", outcome.headline, outcome.body))
+        .await?;
+    Ok(())
+}
+
+#[poise::command(slash_command, guild_only)]
+async fn clear_context(ctx: Context<'_>) -> Result<()> {
+    ensure_admin(ctx).await?;
+    ensure_allowed_channel(ctx).await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| anyhow!("command must run in a guild"))?;
+    let outcome = ctx
+        .data()
+        .app
+        .clear_context(guild_id.get(), ctx.channel_id().get(), actor_from_ctx(ctx))
+        .await?;
+
+    ctx.say(format!("**{}**\n{}", outcome.headline, outcome.body))
+        .await?;
+    Ok(())
+}
+
+#[poise::command(slash_command, guild_only)]
+async fn debug_memory(
+    ctx: Context<'_>,
+    #[description = "Prompt to inspect against the memory system"] prompt: String,
+) -> Result<()> {
+    let _deferred = ctx.defer_or_broadcast().await?;
+    ensure_admin(ctx).await?;
+    ensure_allowed_channel(ctx).await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| anyhow!("command must run in a guild"))?;
+    let report = ctx
+        .data()
+        .app
+        .debug_memory_report(
+            guild_id.get(),
+            ctx.channel_id().get(),
+            actor_from_ctx(ctx),
+            &prompt,
+        )
+        .await?;
+
+    ctx.say(report).await?;
+    Ok(())
+}
+
+#[poise::command(slash_command, guild_only)]
 async fn remember(
     ctx: Context<'_>,
     #[description = "Fact, running joke, or lore worth keeping"] fact: String,
 ) -> Result<()> {
+    let _deferred = ctx.defer_or_broadcast().await?;
     ensure_allowed_channel(ctx).await?;
     let guild_id = ctx
         .guild_id()
@@ -684,6 +792,24 @@ async fn remember(
         state.memories.len()
     ))
     .await?;
+    Ok(())
+}
+
+#[poise::command(slash_command, guild_only)]
+async fn sync_commands(ctx: Context<'_>) -> Result<()> {
+    let _deferred = ctx.defer_or_broadcast().await?;
+    ensure_admin(ctx).await?;
+    let guild_id = ctx
+        .guild_id()
+        .ok_or_else(|| anyhow!("command must run in a guild"))?;
+    poise::builtins::register_in_guild(
+        ctx.serenity_context(),
+        &ctx.framework().options().commands,
+        guild_id,
+    )
+    .await?;
+    ctx.say("Re-registered slash commands in this guild. Guild commands should appear almost immediately.")
+        .await?;
     Ok(())
 }
 
@@ -715,96 +841,110 @@ async fn chat(
 async fn event_handler(
     ctx: &serenity::Context,
     event: &serenity::FullEvent,
-    _framework: poise::FrameworkContext<'_, Data, Error>,
+    framework: poise::FrameworkContext<'_, Data, Error>,
     data: &Data,
 ) -> Result<()> {
-    if let serenity::FullEvent::Message { new_message } = event {
-        if new_message.author.bot {
-            return Ok(());
-        }
-        let Some(guild_id) = new_message.guild_id else {
-            return Ok(());
-        };
-
-        let current_user_id = ctx.cache.current_user().id;
-        let is_mention = new_message
-            .mentions
-            .iter()
-            .any(|user| user.id == current_user_id);
-        let is_reply_to_bot = new_message
-            .referenced_message
-            .as_ref()
-            .is_some_and(|message| message.author.id == current_user_id);
-        let raw_prompt = if is_mention {
-            strip_bot_mentions(&new_message.content, current_user_id)
-        } else {
-            new_message.content.trim().to_string()
-        };
-        if raw_prompt.trim().is_empty() || raw_prompt.starts_with('/') {
-            return Ok(());
-        }
-
-        let actor = ActorRef {
-            user_key: format!("discord:{}", new_message.author.id.get()),
-            user_name: new_message.author.name.clone(),
-        };
-        if is_mention {
-            let _typing = new_message.channel_id.start_typing(&ctx.http);
-            match data
-                .app
-                .speak_from_mention(
-                    guild_id.get(),
-                    new_message.channel_id.get(),
-                    actor,
-                    &raw_prompt,
-                )
-                .await?
+    match event {
+        serenity::FullEvent::GuildCreate { guild, .. } => {
+            if let Err(error) =
+                poise::builtins::register_in_guild(ctx, &framework.options().commands, guild.id)
+                    .await
             {
-                MentionReplyOutcome::Reply(reply) => {
-                    new_message.reply(ctx, reply).await?;
-                }
-                MentionReplyOutcome::Suppressed(reason) => {
-                    info!(
-                        guild_id = guild_id.get(),
-                        channel_id = new_message.channel_id.get(),
-                        user_id = new_message.author.id.get(),
-                        "mention reply suppressed: {reason}"
-                    );
-                }
-            }
-        } else {
-            let looks_publicly_relevant = raw_prompt.contains('?')
-                || raw_prompt.to_ascii_lowercase().contains("drink")
-                || raw_prompt.to_ascii_lowercase().contains("story")
-                || raw_prompt.to_ascii_lowercase().contains("coin")
-                || is_reply_to_bot;
-            let _typing =
-                looks_publicly_relevant.then(|| new_message.channel_id.start_typing(&ctx.http));
-            match data
-                .app
-                .speak_public(
-                    guild_id.get(),
-                    new_message.channel_id.get(),
-                    actor,
-                    &raw_prompt,
-                    &new_message.id.get().to_string(),
-                    is_reply_to_bot,
-                )
-                .await?
-            {
-                PublicReplyOutcome::Reply(reply) => {
-                    new_message.reply(ctx, reply).await?;
-                }
-                PublicReplyOutcome::Suppressed(reason) => {
-                    info!(
-                        guild_id = guild_id.get(),
-                        channel_id = new_message.channel_id.get(),
-                        user_id = new_message.author.id.get(),
-                        "public reply suppressed: {reason}"
-                    );
-                }
+                warn!(
+                    guild_id = guild.id.get(),
+                    "failed to register guild commands on guild create: {error:#}"
+                );
             }
         }
+        serenity::FullEvent::Message { new_message } => {
+            if new_message.author.bot {
+                return Ok(());
+            }
+            let Some(guild_id) = new_message.guild_id else {
+                return Ok(());
+            };
+
+            let current_user_id = ctx.cache.current_user().id;
+            let is_mention = new_message
+                .mentions
+                .iter()
+                .any(|user| user.id == current_user_id);
+            let is_reply_to_bot = new_message
+                .referenced_message
+                .as_ref()
+                .is_some_and(|message| message.author.id == current_user_id);
+            let raw_prompt = if is_mention {
+                strip_bot_mentions(&new_message.content, current_user_id)
+            } else {
+                new_message.content.trim().to_string()
+            };
+            if raw_prompt.trim().is_empty() || raw_prompt.starts_with('/') {
+                return Ok(());
+            }
+
+            let actor = ActorRef {
+                user_key: format!("discord:{}", new_message.author.id.get()),
+                user_name: new_message.author.name.clone(),
+            };
+            if is_mention {
+                let _typing = new_message.channel_id.start_typing(&ctx.http);
+                match data
+                    .app
+                    .speak_from_mention(
+                        guild_id.get(),
+                        new_message.channel_id.get(),
+                        actor,
+                        &raw_prompt,
+                    )
+                    .await?
+                {
+                    MentionReplyOutcome::Reply(reply) => {
+                        new_message.reply(ctx, reply).await?;
+                    }
+                    MentionReplyOutcome::Suppressed(reason) => {
+                        info!(
+                            guild_id = guild_id.get(),
+                            channel_id = new_message.channel_id.get(),
+                            user_id = new_message.author.id.get(),
+                            "mention reply suppressed: {reason}"
+                        );
+                    }
+                }
+            } else {
+                let looks_publicly_relevant = raw_prompt.contains('?')
+                    || raw_prompt.to_ascii_lowercase().contains("drink")
+                    || raw_prompt.to_ascii_lowercase().contains("story")
+                    || raw_prompt.to_ascii_lowercase().contains("coin")
+                    || is_reply_to_bot;
+                let _typing =
+                    looks_publicly_relevant.then(|| new_message.channel_id.start_typing(&ctx.http));
+                match data
+                    .app
+                    .speak_public(
+                        guild_id.get(),
+                        new_message.channel_id.get(),
+                        actor,
+                        &raw_prompt,
+                        &new_message.id.get().to_string(),
+                        is_reply_to_bot,
+                    )
+                    .await?
+                {
+                    PublicReplyOutcome::Reply(reply) => {
+                        new_message.reply(ctx, reply).await?;
+                    }
+                    PublicReplyOutcome::Suppressed(reason) => {
+                        info!(
+                            guild_id = guild_id.get(),
+                            channel_id = new_message.channel_id.get(),
+                            user_id = new_message.author.id.get(),
+                            "public reply suppressed: {reason}"
+                        );
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 
     Ok(())
@@ -822,9 +962,17 @@ async fn ensure_admin(ctx: Context<'_>) -> Result<()> {
         .guild_id()
         .ok_or_else(|| anyhow!("command must run in a guild"))?;
     let state = ctx.data().app.policy(guild_id.get()).await?;
+    if has_admin_access(ctx, &state).await? {
+        Ok(())
+    } else {
+        bail!("admin permission required for this command")
+    }
+}
+
+async fn has_admin_access(ctx: Context<'_>, state: &GuildState) -> Result<bool> {
     let channel = match ctx.channel_id().to_channel(ctx).await? {
         serenity::Channel::Guild(channel) => channel,
-        _ => bail!("command must run in a guild text channel"),
+        _ => return Ok(false),
     };
     let member_binding = ctx
         .author_member()
@@ -842,13 +990,10 @@ async fn ensure_admin(ctx: Context<'_>) -> Result<()> {
     let guild = ctx
         .guild()
         .ok_or_else(|| anyhow!("guild cache not available"))?;
-    let has_manage_guild = guild.user_permissions_in(&channel, member).manage_guild();
+    let permissions = guild.user_permissions_in(&channel, member);
+    let is_owner = guild.owner_id == ctx.author().id;
 
-    if has_manage_guild || has_role {
-        Ok(())
-    } else {
-        bail!("admin permission required for this command")
-    }
+    Ok(is_owner || permissions.administrator() || permissions.manage_guild() || has_role)
 }
 
 async fn ensure_allowed_channel(ctx: Context<'_>) -> Result<()> {
@@ -856,6 +1001,9 @@ async fn ensure_allowed_channel(ctx: Context<'_>) -> Result<()> {
         .guild_id()
         .ok_or_else(|| anyhow!("command must run in a guild"))?;
     let state = ctx.data().app.status(guild_id.get()).await?;
+    if has_admin_access(ctx, &state).await? {
+        return Ok(());
+    }
     if ctx
         .data()
         .app
@@ -867,6 +1015,19 @@ async fn ensure_allowed_channel(ctx: Context<'_>) -> Result<()> {
             "this command is disabled in this channel; allowed channels: {}",
             list_ids(&state.config.permissions.allowed_channel_ids)
         )
+    }
+}
+
+fn parse_stage(input: &str) -> Result<IntoxicationStage> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "sober" => Ok(IntoxicationStage::Sober),
+        "warm" => Ok(IntoxicationStage::Warm),
+        "tipsy" => Ok(IntoxicationStage::Tipsy),
+        "buzzing" | "buzzed" => Ok(IntoxicationStage::Buzzing),
+        "cooked" => Ok(IntoxicationStage::Cooked),
+        "gone" => Ok(IntoxicationStage::Gone),
+        "hungover" | "hangover" => Ok(IntoxicationStage::Hungover),
+        _ => bail!("unknown stage; use sober, warm, tipsy, buzzing, cooked, gone, or hungover"),
     }
 }
 
